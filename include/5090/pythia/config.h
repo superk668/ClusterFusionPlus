@@ -15,25 +15,25 @@
 #define NUM_PER_THREAD 8
 
 // Attention computation constants - adjusted for HEAD_DIM=80
-// For HEAD_DIM=80, we need to reconsider the warp-level parallelism strategy
-// Strategy: Each warp handles 10 rows (80/4/2), with 2 threads per row
-// This gives us better load balance: 4 warps * 10 rows/warp * 2 threads/row = 80 threads
-// But since we have 128 threads (4 warps * 32 threads), we adjust differently
+// For HEAD_DIM=80, NUM_THREAD_PER_ROW=1 causes warp reduction to fail
 // 
-// Alternative: Use same pattern as llama but account for HEAD_DIM=80
-// NUM_ROW_PER_WARP = HEAD_DIM / NUM_WARPS = 80 / 4 = 20
-// NUM_THREAD_PER_ROW = WARP_SIZE / NUM_ROW_PER_WARP = 32 / 20 = 1 (floor division)
-// This means each row is handled by 1-2 threads with some threads handling 2 rows
-#define NUM_ROW_PER_WARP (HEAD_DIM / NUM_WARPS)  // 20
+// New strategy for correctness (sacrificing some performance):
+// Use 4 threads per output dimension, allowing proper warp reduction
+// NUM_ROW_PER_WARP = WARP_SIZE / NUM_THREAD_PER_ROW = 32 / 4 = 8
+// This means each warp computes 8 output dimensions
+// For HEAD_DIM=80, we need 80/8 = 10 warps, but we only have 4
+// Solution: Each warp does multiple passes, or threads compute multiple outputs
+//
+// Better approach: NUM_THREAD_PER_ROW = 4, NUM_ROW_PER_WARP = 8
+// Each warp handles 8 output dimensions with 4 threads per dimension
+// 4 warps * 8 rows = 32 outputs per pass
+// Need 80/32 = 3 passes (last pass handles 80-64=16 outputs)
+// NUM_PER_ROW = 4 * 8 = 32, which gives proper TMA loop coverage
+#define NUM_THREAD_PER_ROW 4  // Use 4 threads per output dimension
+#define NUM_ROW_PER_WARP (WARP_SIZE / NUM_THREAD_PER_ROW)  // 32/4 = 8
 
-// NUM_THREAD_PER_ROW: Threads per row within a warp  
-// 32 threads / 20 rows = 1.6, we use floor = 1 thread per row
-// Note: This means 32 threads will cover 32 rows, but we only need 20
-// In practice, 12 threads will be idle or handle additional work
-#define NUM_THREAD_PER_ROW (WARP_SIZE / NUM_ROW_PER_WARP)  // 1
-
-// NUM_PER_ROW: Elements processed per row
-#define NUM_PER_ROW (NUM_PER_THREAD * NUM_THREAD_PER_ROW)  // 8
+// NUM_PER_ROW: Elements processed per row (each thread processes NUM_PER_THREAD elements)
+#define NUM_PER_ROW (NUM_PER_THREAD * NUM_THREAD_PER_ROW)  // 8 * 4 = 32
 
 #define DIM_PER_BLOCK (HIDDEN_DIM / CLUSTER_SIZE)  // 640
 // #define KV_DIM_PER_BLOCK (SEQ_LEN / CLUSTER_SIZE) 

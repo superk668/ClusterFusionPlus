@@ -64,6 +64,13 @@ __global__ void __cluster_dims__(CLUSTER_SIZE, 1, 1) PythiaDecoderLayerKernel(
     uint32_t src_addr, dst_addr, neighbor_dst_bar = 0;
     float __align__(16) qk[DEC_TILE];
 
+    // DEBUG: Check if kernel is called
+    if (tid == 0 && head_id == 0 && cluster_block_id == 0) {
+        printf("===== PYTHIA KERNEL STARTED =====\n");
+        printf("head_id=%d, cluster_block_id=%d, tid=%d\n", head_id, cluster_block_id, tid);
+        printf("HEAD_DIM=%d, HIDDEN_DIM=%d, CLUSTER_SIZE=%d\n", HEAD_DIM, HIDDEN_DIM, CLUSTER_SIZE);
+    }
+    
     // Init barrier
     #pragma nv_diag_suppress static_var_with_dynamic_init
     __shared__ barrier bar[4];
@@ -84,7 +91,7 @@ __global__ void __cluster_dims__(CLUSTER_SIZE, 1, 1) PythiaDecoderLayerKernel(
 
     // Precompute some indices
     uint input_idx = (lane_id % NUM_THREAD_PER_ROW) * NUM_PER_THREAD;
-    uint weight_idx = warp_id * NUM_ROW_PER_WARP + lane_id / NUM_THREAD_PER_ROW;
+    // weight_idx removed - computed per-pass now
     uint input_idx_2 = (lane_id % NUM_THREAD_PER_ROW_2) * NUM_PER_THREAD;
     uint weight_idx_2 = warp_id * NUM_ROW_PER_WARP_2 + (lane_id / NUM_THREAD_PER_ROW_2) * DEC_TILE;
     uint input_idx_3 = (lane_id % NUM_THREAD_PER_ROW_3) * NUM_PER_THREAD;
@@ -152,7 +159,13 @@ __global__ void __cluster_dims__(CLUSTER_SIZE, 1, 1) PythiaDecoderLayerKernel(
     cluster.sync();
 
     // Compute input @ w_q
-    // Preload weight_q
+    // With NUM_THREAD_PER_ROW=4, NUM_ROW_PER_WARP=8:
+    // Each warp computes 8 outputs, 4 warps * 8 = 32 outputs per pass
+    // For HEAD_DIM=80, need 80/32 = 3 passes
+    const int outputs_per_pass = NUM_WARPS * NUM_ROW_PER_WARP;
+    const int num_passes = (HEAD_DIM + outputs_per_pass - 1) / outputs_per_pass;
+    
+    // Preload weight_q (all TMA loads, shared across all passes)
     if (tid == 0) {
         cde::cp_async_bulk_tensor_2d_global_to_shared(&weight[0], &tensor_map, cluster_head_idx, cluster_block_st_id, bar[0]);
         token[0] = cuda::device::barrier_arrive_tx(bar[0], 1, TMA_LOAD_ONCE_SIZE);
@@ -168,34 +181,45 @@ __global__ void __cluster_dims__(CLUSTER_SIZE, 1, 1) PythiaDecoderLayerKernel(
             token[id % 2] = bar[id % 2].arrive();
         }
         bar[(id - 1) % 2].wait(std::move(token[(id - 1) % 2]));
-        for (int i = 0; i < TMA_LOAD_ONCE; i+=NUM_PER_ROW) { 
-            *(uint4*)(&reg_input[0]) = *(uint4*)(&input_shmem[input_idx + (id - 1) * TMA_LOAD_ONCE + i]);
-            #pragma unroll
-            for (int d = 0; d < NUM_PER_THREAD; d++) {
-                tmp += __half2float(reg_input[d]) * __half2float(weight[((id - 1) % 2) * TMA_LOAD_ONCE_NUM + (input_idx + i + d) * HEAD_DIM + weight_idx]);
-            }
-        }
     }
     bar[(DIM_PER_BLOCK / TMA_LOAD_ONCE - 1) % 2].wait(std::move(token[(DIM_PER_BLOCK / TMA_LOAD_ONCE - 1) % 2]));
-    for (int i = 0; i < TMA_LOAD_ONCE; i+=NUM_PER_ROW) { 
-        *(uint4*)(&reg_input[0]) = *(uint4*)(&input_shmem[input_idx + ((DIM_PER_BLOCK / TMA_LOAD_ONCE) - 1) * TMA_LOAD_ONCE + i]);
+    
+    // Now compute Q in multiple passes
+    for (int pass = 0; pass < num_passes; pass++) {
+        const int base_output_idx = pass * outputs_per_pass;
+        const int current_weight_idx = base_output_idx + warp_id * NUM_ROW_PER_WARP + lane_id / NUM_THREAD_PER_ROW;
+        
+        // Skip if this thread's output index exceeds HEAD_DIM
+        if (current_weight_idx >= HEAD_DIM) continue;
+        
+        tmp = 0.0f;
+        
+        // DEBUG: Track computation for output_idx=0 in head_id=1, block=0, pass=0
+        const bool debug_this = (head_id == 1 && cluster_block_id == 0 && pass == 0 && current_weight_idx == 0 && lane_id % NUM_THREAD_PER_ROW == 0);
+        
+        // Compute dot product over all input dimensions
+        for (int id = 0; id < DIM_PER_BLOCK / TMA_LOAD_ONCE; id++) {
+            for (int i = 0; i < TMA_LOAD_ONCE; i+=NUM_PER_ROW) { 
+                *(uint4*)(&reg_input[0]) = *(uint4*)(&input_shmem[id * TMA_LOAD_ONCE + input_idx + i]);
+                #pragma unroll
+                for (int d = 0; d < NUM_PER_THREAD; d++) {
+                    tmp += __half2float(reg_input[d]) * __half2float(weight[(id % 2) * TMA_LOAD_ONCE_NUM + (input_idx + i + d) * HEAD_DIM + current_weight_idx]);
+                }
+            }
+        }
+        
         #pragma unroll
-        for (int d = 0; d < NUM_PER_THREAD; d++) {
-            tmp += __half2float(reg_input[d]) * __half2float(weight[TMA_LOAD_ONCE_NUM + (input_idx + i + d) * HEAD_DIM + weight_idx]);
+        for (int mask = (NUM_THREAD_PER_ROW >> 1); mask > 0; mask >>= 1) {
+            tmp += __shfl_down_sync(0xffffffff, tmp, mask);
+        }
+        
+        if (lane_id % NUM_THREAD_PER_ROW == 0 && current_weight_idx < HEAD_DIM) {
+            local_qkv[current_weight_idx] = __float2half(tmp);
         }
     }
-    #pragma unroll
-    for (int mask = (NUM_THREAD_PER_ROW >> 1); mask > 0; mask >>= 1) {
-        tmp += __shfl_down_sync(0xffffffff, tmp, mask);
-    }
-    if (lane_id % NUM_THREAD_PER_ROW == 0) {
-        local_qkv[warp_id * NUM_ROW_PER_WARP + lane_id / NUM_THREAD_PER_ROW] = __float2half(tmp);
-    }
     block.sync();
-
     // Compute input @ w_k
-    // Preload weight_k
-    tmp = 0.0;
+    // Preload weight_k (all TMA loads, shared across all passes)
     if (tid == 0) {
         cde::cp_async_bulk_tensor_2d_global_to_shared(&weight[0], &tensor_map, cluster_head_idx, HIDDEN_DIM + cluster_block_st_id, bar[0]);
         token[0] = cuda::device::barrier_arrive_tx(bar[0], 1, TMA_LOAD_ONCE_SIZE);
@@ -211,34 +235,41 @@ __global__ void __cluster_dims__(CLUSTER_SIZE, 1, 1) PythiaDecoderLayerKernel(
             token[id % 2] = bar[id % 2].arrive();
         }
         bar[(id - 1) % 2].wait(std::move(token[(id - 1) % 2]));
-        for (int i = 0; i < TMA_LOAD_ONCE; i+=NUM_PER_ROW) { 
-            *(uint4*)(&reg_input[0]) = *(uint4*)(&input_shmem[input_idx + (id - 1) * TMA_LOAD_ONCE + i]);
-            #pragma unroll
-            for (int d = 0; d < NUM_PER_THREAD; d++) {
-                tmp += __half2float(reg_input[d]) * __half2float(weight[((id - 1) % 2) * TMA_LOAD_ONCE_NUM + (input_idx + i + d) * HEAD_DIM + weight_idx]);
-            }
-        }
     }
     bar[(DIM_PER_BLOCK / TMA_LOAD_ONCE - 1) % 2].wait(std::move(token[(DIM_PER_BLOCK / TMA_LOAD_ONCE - 1) % 2]));
-    for (int i = 0; i < TMA_LOAD_ONCE; i+=NUM_PER_ROW) { 
-        *(uint4*)(&reg_input[0]) = *(uint4*)(&input_shmem[input_idx + ((DIM_PER_BLOCK / TMA_LOAD_ONCE) - 1) * TMA_LOAD_ONCE + i]);
-        #pragma unroll
-        for (int d = 0; d < NUM_PER_THREAD; d++) {
-            tmp += __half2float(reg_input[d]) * __half2float(weight[TMA_LOAD_ONCE_NUM + (input_idx + i + d) * HEAD_DIM + weight_idx]);
+    
+    // Now compute K in multiple passes
+    for (int pass = 0; pass < num_passes; pass++) {
+        const int base_output_idx = pass * outputs_per_pass;
+        const int current_weight_idx = base_output_idx + warp_id * NUM_ROW_PER_WARP + lane_id / NUM_THREAD_PER_ROW;
+        
+        if (current_weight_idx >= HEAD_DIM) continue;
+        
+        tmp = 0.0f;
+        
+        // Compute dot product over all input dimensions
+        for (int id = 0; id < DIM_PER_BLOCK / TMA_LOAD_ONCE; id++) {
+            for (int i = 0; i < TMA_LOAD_ONCE; i+=NUM_PER_ROW) { 
+                *(uint4*)(&reg_input[0]) = *(uint4*)(&input_shmem[id * TMA_LOAD_ONCE + input_idx + i]);
+                #pragma unroll
+                for (int d = 0; d < NUM_PER_THREAD; d++) {
+                    tmp += __half2float(reg_input[d]) * __half2float(weight[(id % 2) * TMA_LOAD_ONCE_NUM + (input_idx + i + d) * HEAD_DIM + current_weight_idx]);
+                }
+            }
         }
-    }
-    #pragma unroll
-    for (int mask = (NUM_THREAD_PER_ROW >> 1); mask > 0; mask >>= 1) {
-        tmp += __shfl_down_sync(0xffffffff, tmp, mask);
-    }
-    if (lane_id % NUM_THREAD_PER_ROW == 0) {
-        local_qkv[HEAD_DIM + warp_id * NUM_ROW_PER_WARP + lane_id / NUM_THREAD_PER_ROW] = __float2half(tmp);
+        
+        #pragma unroll
+        for (int mask = (NUM_THREAD_PER_ROW >> 1); mask > 0; mask >>= 1) {
+            tmp += __shfl_down_sync(0xffffffff, tmp, mask);
+        }
+        if (lane_id % NUM_THREAD_PER_ROW == 0 && current_weight_idx < HEAD_DIM) {
+            local_qkv[HEAD_DIM + current_weight_idx] = __float2half(tmp);
+        }
     }
     block.sync();
 
     // Compute input @ w_v
-    // Preload weight_v
-    tmp = 0.0;
+    // Preload weight_v (all TMA loads, shared across all passes)
     if (tid == 0) {
         cde::cp_async_bulk_tensor_2d_global_to_shared(&weight[0], &tensor_map, cluster_head_idx, HIDDEN_DIM * 2 + cluster_block_st_id, bar[0]);
         token[0] = cuda::device::barrier_arrive_tx(bar[0], 1, TMA_LOAD_ONCE_SIZE);
@@ -254,30 +285,53 @@ __global__ void __cluster_dims__(CLUSTER_SIZE, 1, 1) PythiaDecoderLayerKernel(
             token[id % 2] = bar[id % 2].arrive();
         }
         bar[(id - 1) % 2].wait(std::move(token[(id - 1) % 2]));
-        for (int i = 0; i < TMA_LOAD_ONCE; i+=NUM_PER_ROW) { 
-            *(uint4*)(&reg_input[0]) = *(uint4*)(&input_shmem[input_idx + (id - 1) * TMA_LOAD_ONCE + i]);
-            #pragma unroll
-            for (int d = 0; d < NUM_PER_THREAD; d++) {
-                tmp += __half2float(reg_input[d]) * __half2float(weight[((id - 1) % 2) * TMA_LOAD_ONCE_NUM + (input_idx + i + d) * HEAD_DIM + weight_idx]);
-            }
-        }
     }
     bar[(DIM_PER_BLOCK / TMA_LOAD_ONCE - 1) % 2].wait(std::move(token[(DIM_PER_BLOCK / TMA_LOAD_ONCE - 1) % 2]));
-    for (int i = 0; i < TMA_LOAD_ONCE; i+=NUM_PER_ROW) { 
-        *(uint4*)(&reg_input[0]) = *(uint4*)(&input_shmem[input_idx + ((DIM_PER_BLOCK / TMA_LOAD_ONCE) - 1) * TMA_LOAD_ONCE + i]);
+    
+    // Now compute V in multiple passes
+    for (int pass = 0; pass < num_passes; pass++) {
+        const int base_output_idx = pass * outputs_per_pass;
+        const int current_weight_idx = base_output_idx + warp_id * NUM_ROW_PER_WARP + lane_id / NUM_THREAD_PER_ROW;
+        
+        if (current_weight_idx >= HEAD_DIM) continue;
+        
+        tmp = 0.0f;
+        
+        // Compute dot product over all input dimensions
+        for (int id = 0; id < DIM_PER_BLOCK / TMA_LOAD_ONCE; id++) {
+            for (int i = 0; i < TMA_LOAD_ONCE; i+=NUM_PER_ROW) { 
+                *(uint4*)(&reg_input[0]) = *(uint4*)(&input_shmem[id * TMA_LOAD_ONCE + input_idx + i]);
+                #pragma unroll
+                for (int d = 0; d < NUM_PER_THREAD; d++) {
+                    tmp += __half2float(reg_input[d]) * __half2float(weight[(id % 2) * TMA_LOAD_ONCE_NUM + (input_idx + i + d) * HEAD_DIM + current_weight_idx]);
+                }
+            }
+        }
+        
         #pragma unroll
-        for (int d = 0; d < NUM_PER_THREAD; d++) {
-            tmp += __half2float(reg_input[d]) * __half2float(weight[TMA_LOAD_ONCE_NUM + (input_idx + i + d) * HEAD_DIM + weight_idx]);
+        for (int mask = (NUM_THREAD_PER_ROW >> 1); mask > 0; mask >>= 1) {
+            tmp += __shfl_down_sync(0xffffffff, tmp, mask);
+        }
+        if (lane_id % NUM_THREAD_PER_ROW == 0 && current_weight_idx < HEAD_DIM) {
+            local_qkv[HEAD_DIM * 2 + current_weight_idx] = __float2half(tmp);
         }
     }
-    #pragma unroll
-    for (int mask = (NUM_THREAD_PER_ROW >> 1); mask > 0; mask >>= 1) {
-        tmp += __shfl_down_sync(0xffffffff, tmp, mask);
-    }
-    if (lane_id % NUM_THREAD_PER_ROW == 0) {
-        local_qkv[HEAD_DIM * 2 + warp_id * NUM_ROW_PER_WARP + lane_id / NUM_THREAD_PER_ROW] = __float2half(tmp);
-    }
     block.sync();
+
+    // DEBUG: Before cluster_reduce, check partial Q values from ALL blocks
+    if (head_id == 1 && tid == 0) {
+        printf("\n===== PARTIAL Q FROM BLOCK %d =====\n", cluster_block_id);
+        printf("partial_q[0:10]: ");
+        for (int i = 0; i < 10; i++) {
+            printf("%.4f ", __half2float(local_qkv[i]));
+        }
+        printf("\npartial_q[70:80]: ");
+        for (int i = 70; i < 80; i++) {
+            printf("%.4f ", __half2float(local_qkv[i]));
+        }
+        printf("\n");
+    }
+    // NOTE: Removed cluster.sync() here to avoid deadlock in printf
 
     // ClusterReduce
     size = (HEAD_DIM * 3) * sizeof(half);
@@ -288,23 +342,37 @@ __global__ void __cluster_dims__(CLUSTER_SIZE, 1, 1) PythiaDecoderLayerKernel(
         src_addr, dst_addr, bar_ptr, 
         neighbor_dst_bar, local_qkv, weight);
 
-    // DEBUG: Print Q/K before RoPE (head_id == 1 only)
+    // DEBUG: After cluster_reduce, check accumulated Q values
     if (head_id == 1 && cluster_block_id == 0 && tid == 0) {
-        printf("before RoPE\n");
-        printf("q, head_id = 1: first 8, last 8\n");
-        for (int i = 0; i < 8; i++) {
+        printf("\n===== ACCUMULATED Q (after cluster_reduce) =====\n");
+        printf("accumulated_q[0:10]: ");
+        for (int i = 0; i < 10; i++) {
+            printf("%.4f ", __half2float(local_qkv[i]));
+        }
+        printf("\naccumulated_q[70:80]: ");
+        for (int i = 70; i < 80; i++) {
             printf("%.4f ", __half2float(local_qkv[i]));
         }
         printf("\n");
+    }
+    cluster.sync();
+
+    // DEBUG: Print Q/K before RoPE
+    if (head_id == 1 && cluster_block_id == 0 && tid == 0) {
+        printf("\n===== BEFORE RoPE =====\n");
+        printf("q[0:8]: ");
+        for (int i = 0; i < 8; i++) {
+            printf("%.4f ", __half2float(local_qkv[i]));
+        }
+        printf("\nq[72:80]: ");
         for (int i = 72; i < 80; i++) {
             printf("%.4f ", __half2float(local_qkv[i]));
         }
-        printf("\n");
-        printf("k_new, head_id = 1: first 8, last 8\n");
+        printf("\nk[0:8]: ");
         for (int i = 0; i < 8; i++) {
             printf("%.4f ", __half2float(local_qkv[HEAD_DIM + i]));
         }
-        printf("\n");
+        printf("\nk[72:80]: ");
         for (int i = 72; i < 80; i++) {
             printf("%.4f ", __half2float(local_qkv[HEAD_DIM + i]));
         }
@@ -342,24 +410,23 @@ __global__ void __cluster_dims__(CLUSTER_SIZE, 1, 1) PythiaDecoderLayerKernel(
     }
     // Dimensions from ROTARY_DIM to HEAD_DIM remain unchanged
     
-    // DEBUG: Print Q/K after RoPE (head_id == 1 only)
+    // DEBUG: Print Q/K after RoPE
     block.sync();
     if (head_id == 1 && cluster_block_id == 0 && tid == 0) {
-        printf("after RoPE\n");
-        printf("q, head_id = 1: first 8, last 8\n");
+        printf("\n===== AFTER RoPE =====\n");
+        printf("q[0:8]: ");
         for (int i = 0; i < 8; i++) {
             printf("%.4f ", __half2float(local_qkv[i]));
         }
-        printf("\n");
+        printf("\nq[72:80]: ");
         for (int i = 72; i < 80; i++) {
             printf("%.4f ", __half2float(local_qkv[i]));
         }
-        printf("\n");
-        printf("k_new, head_id = 1: first 8, last 8\n");
+        printf("\nk[0:8]: ");
         for (int i = 0; i < 8; i++) {
             printf("%.4f ", __half2float(local_qkv[HEAD_DIM + i]));
         }
-        printf("\n");
+        printf("\nk[72:80]: ");
         for (int i = 72; i < 80; i++) {
             printf("%.4f ", __half2float(local_qkv[HEAD_DIM + i]));
         }
