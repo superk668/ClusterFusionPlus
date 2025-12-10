@@ -7,7 +7,7 @@ import clusterfusion
 # Pythia-2.8b model parameters
 hidden_size = 2560
 num_heads = 32
-seqlen = 128  # Start with small seqlen for debugging
+seqlen = 2047  # Start with small seqlen for debugging
 head_dim = hidden_size // num_heads  # 80
 ffn_dim = 10240
 rotary_dim = head_dim // 4  # 20 (rotary_pct = 0.25)

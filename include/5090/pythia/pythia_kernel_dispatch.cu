@@ -80,8 +80,8 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> pythia_decoder_layer_sm1
         CUtensorMapFloatOOBfill::CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE
     );
 
-    // K cache tensor map - use max cache size to allow reading future positions
-    uint64_t size_k_cache[rank] = {HIDDEN_DIM, max_cache_size};
+    // K cache tensor map - use SEQ_LEN so TMA auto-fills OOB positions with 0
+    uint64_t size_k_cache[rank] = {HIDDEN_DIM, SEQ_LEN};
     uint64_t stride_k_cache[rank - 1] = {HIDDEN_DIM * sizeof(half)};
     uint32_t box_size_k_cache[rank] = {HEAD_DIM, TMA_LOAD_ONCE / 2};
     uint32_t elem_stride_k_cache[rank] = {1, 1};
@@ -101,8 +101,8 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> pythia_decoder_layer_sm1
         CUtensorMapFloatOOBfill::CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE
     );
 
-    // V cache tensor map - use max cache size to allow reading future positions
-    uint64_t size_v_cache[rank] = {HIDDEN_DIM, max_cache_size};
+    // V cache tensor map - use SEQ_LEN so TMA auto-fills OOB positions with 0
+    uint64_t size_v_cache[rank] = {HIDDEN_DIM, SEQ_LEN};
     uint64_t stride_v_cache[rank - 1] = {HIDDEN_DIM * sizeof(half)};
     uint32_t box_size_v_cache[rank] = {HEAD_DIM, TMA_LOAD_ONCE / 2};
     uint32_t elem_stride_v_cache[rank] = {1, 1};

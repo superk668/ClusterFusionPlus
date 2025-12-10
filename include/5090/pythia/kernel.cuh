@@ -459,19 +459,16 @@ __global__ void __cluster_dims__(CLUSTER_SIZE, 1, 1) PythiaDecoderLayerKernel(
         pre_max = local_max;
         #pragma unroll
         for (int j = 0; j < DEC_TILE; j++) {
-            // Bounds check: only load if both head_dim and seq_len valid
-            uint32_t seq_idx = cluster_block_id * KV_DIM_PER_BLOCK + weight_idx_2 + j;
-            if (input_idx_2 < HEAD_DIM && seq_idx < SEQ_LEN) {
+            // TMA auto-fills OOB positions with 0, so no bounds check needed for loading
+            if (input_idx_2 < HEAD_DIM) {
                 *(uint4*)(&reg_weight[0]) = *(uint4*)(&weight[((id - 1) % 2) * TMA_LOAD_ONCE_NUM + (weight_idx_2 + j) * HEAD_DIM + input_idx_2]);
-                qk[j] = 0.0f;
-                #pragma unroll
-                for (int d = 0; d < NUM_PER_THREAD; d++) {
-                    qk[j] += __half2float(reg_input[d]) * __half2float(reg_weight[d]);
-                }
             } else {
-                // Masked positions: zero weights and set qk to large negative to exclude from softmax
                 for (int i = 0; i < NUM_PER_THREAD; i++) reg_weight[i] = __float2half(0.0f);
-                qk[j] = -CUDART_INF_F;
+            }
+            qk[j] = 0.0f;
+            #pragma unroll
+            for (int d = 0; d < NUM_PER_THREAD; d++) {
+                qk[j] += __half2float(reg_input[d]) * __half2float(reg_weight[d]);
             }
             #pragma unroll
             for (int mask = (NUM_THREAD_PER_ROW_2 >> 1); mask > 0; mask >>= 1) {
@@ -520,8 +517,9 @@ __global__ void __cluster_dims__(CLUSTER_SIZE, 1, 1) PythiaDecoderLayerKernel(
     pre_max = local_max;
     #pragma unroll
     for (int j = 0; j < DEC_TILE; j++) {
+        // TMA auto-fills OOB positions with 0, so no bounds check needed for loading
         if (input_idx_2 < HEAD_DIM) {
-        *(uint4*)(&reg_weight[0]) = *(uint4*)(&weight[((KV_DIM_PER_BLOCK / TMA_LOAD_ONCE_ATTN - 1) % 2) * TMA_LOAD_ONCE_NUM + (weight_idx_2 + j) * HEAD_DIM + input_idx_2]);
+            *(uint4*)(&reg_weight[0]) = *(uint4*)(&weight[((KV_DIM_PER_BLOCK / TMA_LOAD_ONCE_ATTN - 1) % 2) * TMA_LOAD_ONCE_NUM + (weight_idx_2 + j) * HEAD_DIM + input_idx_2]);
         } else {
             for (int i = 0; i < NUM_PER_THREAD; i++) reg_weight[i] = __float2half(0.0f);
         }
@@ -688,9 +686,11 @@ __global__ void __cluster_dims__(CLUSTER_SIZE, 1, 1) PythiaDecoderLayerKernel(
         }
         cluster.sync();
     }
+    // Add epsilon to prevent division by zero when all exp values underflow
+    float safe_sum = cluster_local_sum + 1e-10f;
     #pragma unroll
     for (int j = 0; j < NUM_PER_THREAD; j++) {
-        reg_reduce[j] = reg_reduce[j] * __frcp_rn(cluster_local_sum);
+        reg_reduce[j] = reg_reduce[j] * __frcp_rn(safe_sum);
     }
     // Only threads that cover valid HEAD_DIM indices write output
     if(tid < NUM_THREAD_PER_ROW_2 && tid * NUM_PER_THREAD < HEAD_DIM) {
