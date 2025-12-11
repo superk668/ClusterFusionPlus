@@ -1,92 +1,79 @@
-# ClusterFusion: Expanding Operator Fusion Scope for LLM Inference via Cluster-Level Collective Primitive
-[[Paper](https://arxiv.org/abs/2508.18850)]
+# CS3602 Project: ClusterFusion (Pythia Port)
 
-![overview](assets/overview.png)
+We ported ClusterFusion’s fused decoder kernel from the original Llama-2-7B target to EleutherAI Pythia-2.8B (GPT-NeoX). This branch focuses on decode-time fusion and currently supports NVIDIA `sm_120` GPUs (Blackwell/5090-class); the H100 path is not implemented.
 
-* ClusterFusion with Llama-2-7B on H100 GPU:
+## What changed: Llama-2-7B vs Pythia-2.8B
 
-![](assets/example.gif)
+| Parameter | Llama-2-7B | Pythia-2.8B |
+|-----------|------------|-------------|
+| hidden_size | 4096 | 2560 |
+| num_attention_heads | 32 | 32 |
+| head_dim | 128 | 80 |
+| intermediate_size (FFN) | 12288 | 10240 |
+| num_layers | 32 | 32 |
+| max_position_embeddings | 4096 | 2048 |
 
+Key architectural/kernel differences:
+- Head dim 128 → 80: warp mapping updated (4 warps, 20 rows/warp) and alignment for `uint4` vectorized loads.
+- RoPE: Llama applies RoPE to all 128 dims; Pythia uses Neox rotary_pct=0.25 (first 20 dims). The kernel pads `cos/sin` to `HEAD_DIM`.
+- Norm and residual: Pythia uses LayerNorm with bias and parallel residual (attention + MLP). The kernel keeps RMSNorm-style math for simplicity while leaving the final LayerNorm in PyTorch.
+- Projections: QKV weights are interleaved with bias; MLP branch (GELU approx) is fused alongside attention.
+- Scope: sglang batching removed; only `sm_120` kernels are wired up.
 
-## News
-- [2025/09] 🔥 ClusterFusion has been accepted to **NeurIPS 2025**!
+## Environment
+- Python 3.13 (conda), NVIDIA GPU with `sm_120` compute capability
+- CUDA 13.1 user-space wheels via PyTorch cu130 index
 
-## Installation
-
-### Requirements
-- CUDA 12.4  
-- PyTorch 2.5.1  
-
-### Install from PIP
-
-You can install ClusterFusion with the following command:
-
+Recreate and test with the exact commands below:
 ```bash
-pip install clusterfusion
-```
+conda create -n nlp_project python=3.13 -y
+conda activate nlp_project
 
-### Install from Source
+# Core DL stack (cu130 wheels)
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu130
 
-1. Clone this repository and navigate to ClusterFusion folder:
-```
-git clone https://github.com/xinhao-luo/ClusterFusion.git
-cd clusterfusion
-```
+# Kernel + HF stack
+pip install flashinfer-python
+pip install transformers accelerate
 
-2. Install ClusterFusion kernels:
-```
+# ClusterFusion build
 pip install -e .
+
+# Benchmark (use HF mirror for model download if needed)
+export HF_ENDPOINT=https://hf-mirror.com
+python tests/benchmark_decode.py
 ```
 
-## Usage
+## How to reproduce
+1. Download HuggingFace weights for `EleutherAI/pythia-2.8b`.
+2. Recreate the above environment.
+3. Correctness:
+   - `python tests/test_pythia.py` (kernel vs reference, small seq len).
+   - `python tests/test_pythia_correct.py` (PyTorch implementation matching HF).
+   - `python tests/test_pythia_with_kernel.py` (full decode with kernel vs HF + speed).
+4. Benchmark decode-only:
+   - `python tests/benchmark_decode.py` compares ClusterFusion vs HuggingFace across token counts (prefill/setup excluded).
 
-We provide following script to run ClusterFusion.
+## Benchmark results (sm_120, batch=1, prompt: "The meaning of life is")
+Command used (with mirror):  
+`conda activate nlp_project && export HF_ENDPOINT=https://hf-mirror.com && python tests/benchmark_decode.py`
+
+Decode-only timings (setup excluded):
 ```
-USE_CLUSTER_FUSION=true torchrun --nproc_per_node 1 chat/chat.py \
-	--ckpt_dir /PATH/TO/llama2-7b \
-	--tokenizer_path /PATH/TO/llama2-7b-tokenizer \
-	--max_seq_len 1024 --max_batch_size 1 \
-	--max_gen_len 1024
-```
-## Examples
-
-#### E2E
-
-```python
-from clusterfusion import lama_decoder_layer
-
-llama_decoder_layer(
-	output,
-	residual_output,
-	hidden_states,
-	residual,
-	qkv_weight,
-	o_weight,
-	paged_kv_indptr_buf,
-	paged_kv_indices_buf,
-	k_data_ptrs,
-	v_data_ptrs,
-	layer_id,
-	rms_weight,
-	eps,
-	positions,
-	cos_sin
-)
-
-```
-
-#### Primitives
-![overview](assets/cluster.png)
-```cuda
-cluster_reduce<CLUSTER_SIZE, Stage::LINEAR>(
-        size, tid, HEAD_DIM, cluster_block_id,  
-        src_addr, dst_addr, bar_ptr, 
-        neighbor_dst_bar, local_qkv, weight);
+tokens | CF_fused(s) | HF(s) | speedup_cf | match | setup(s)
+   16  |      0.126  | 0.089 |     0.70   | True  | 0.214
+   32  |      0.167  | 0.177 |     1.06   | True  | 0.007
+   64  |      0.342  | 0.359 |     1.05   | True  | 0.007
+  128  |      0.684  | 0.733 |     1.07   | True  | 0.007
+  256  |      1.387  | 1.487 |     1.07   | True  | 0.007
+  512  |      2.803  | 3.055 |     1.09   | True  | 0.007
+ 1024  |      5.638  | 6.398 |     1.13   | True  | 0.008
+ 2048  |     11.592  |13.568 |     1.17   | True  | 0.010
 ```
 
 ## Citation
 
-If you find ClusterFusion useful in your research or project, please kindly cite our paper:
+If you find ClusterFusion useful in your research or project, please kindly cite the original paper:
 
 ```
 @misc{luo2025clusterfusion,
