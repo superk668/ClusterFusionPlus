@@ -155,7 +155,7 @@ def decode_clusterfusion(model, prompt, num_new_tokens, state, use_cuda_graph=Fa
                 weights = all_weights[layer_idx]
                 k_cache_full, v_cache_full, current_len = kv_caches[layer_idx]
 
-                hidden_states, _, _ = clusterfusion.pythia_decoder_layer(
+                hidden_states, _, _ = clusterfusion.pythia_2b8_decoder_layer(
                     hidden_states,
                     weights["qkv_weight"],
                     weights["qkv_bias"],
@@ -222,7 +222,7 @@ def decode_clusterfusion_graph_context(model, prompt, num_new_tokens, state):
     for layer_idx in range(num_layers):
         weights = all_weights[layer_idx]
         k_cache_full, v_cache_full, _ = kv_caches[layer_idx]
-        clusterfusion.pythia_create_graph_context(
+        clusterfusion.pythia_2b8_create_graph_context(
             layer_idx,  # context_id
             k_cache_full,
             v_cache_full,
@@ -246,7 +246,7 @@ def decode_clusterfusion_graph_context(model, prompt, num_new_tokens, state):
                 weights = all_weights[layer_idx]
                 k_cache_full, v_cache_full, current_len = kv_caches[layer_idx]
 
-                output, _, _ = clusterfusion.pythia_graph_decode_step(
+                output, _, _ = clusterfusion.pythia_2b8_graph_decode_step(
                     layer_idx,  # context_id
                     hidden_states,
                     weights["ln_weight"],
@@ -283,7 +283,7 @@ def decode_clusterfusion_graph_context(model, prompt, num_new_tokens, state):
 
     # Clean up contexts
     for layer_idx in range(num_layers):
-        clusterfusion.pythia_destroy_graph_context(layer_idx)
+        clusterfusion.pythia_2b8_destroy_graph_context(layer_idx)
 
     return decode_time, generated_ids
 

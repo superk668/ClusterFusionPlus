@@ -1,33 +1,32 @@
 #include "kernel.cuh"
 #include <torch/extension.h>
 
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> pythia_decoder_layer_sm120(
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> pythia_6b9_decoder_layer_sm120(
     torch::Tensor input,
-    torch::Tensor weight_qkv,      // [3 * num_heads * head_dim, hidden_dim] = [7680, 2560]
-    torch::Tensor bias_qkv,        // [3 * num_heads * head_dim] = [7680]
-    torch::Tensor weight_o,        // [hidden_dim, hidden_dim] = [2560, 2560]
+    torch::Tensor weight_qkv,      // [3 * num_heads * head_dim, hidden_dim] = [12288, 4096]
+    torch::Tensor bias_qkv,        // [3 * num_heads * head_dim] = [12288]
+    torch::Tensor weight_o,        // [hidden_dim, hidden_dim] = [4096, 4096]
     torch::Tensor bias_o,          // [hidden_dim]
     torch::Tensor k_cache,         // Full cache buffer [max_seq_len, hidden_dim]
     torch::Tensor v_cache,         // Full cache buffer [max_seq_len, hidden_dim]
-    torch::Tensor layernorm_weight,  // [hidden_dim] = [2560]
-    torch::Tensor layernorm_bias,    // [hidden_dim] = [2560]
+    torch::Tensor layernorm_weight,  // [hidden_dim] = [4096]
+    torch::Tensor layernorm_bias,    // [hidden_dim] = [4096]
     torch::Tensor cos,
     torch::Tensor sin,
     // MLP weights
     torch::Tensor post_ln_weight,    // [hidden_dim]
     torch::Tensor post_ln_bias,      // [hidden_dim]
-    torch::Tensor mlp_up_weight,     // [ffn_dim, hidden_dim] = [10240, 2560]
+    torch::Tensor mlp_up_weight,     // [ffn_dim, hidden_dim] = [16384, 4096]
     torch::Tensor mlp_up_bias,       // [ffn_dim]
-    torch::Tensor mlp_down_weight,   // [hidden_dim, ffn_dim] = [2560, 10240]
+    torch::Tensor mlp_down_weight,   // [hidden_dim, ffn_dim] = [4096, 16384]
     torch::Tensor mlp_down_bias,     // [hidden_dim]
     int64_t current_seq_len          // Current sequence length (before appending new token)
 ) 
 {
-    cudaFuncSetAttribute(PythiaDecoderLayerKernel, cudaFuncAttributeNonPortableClusterSizeAllowed, 1);
+    cudaFuncSetAttribute(Pythia6b9DecoderLayerKernel, cudaFuncAttributeNonPortableClusterSizeAllowed, 1);
     // Shared memory layout: weight(2*TMA*MAX) + local_qkv(3*HEAD) + input_shmem(DIM_PER_BLOCK) + reduction
-    // ~23KB total, well within 96KB limit
     uint32_t max_shmem_size = 128 * sizeof(char) + (2 * TMA_LOAD_ONCE * MAX_SMEM_DIM + DIM_PER_BLOCK + 3 * HEAD_DIM) * sizeof(half) + DIM_BLOCK_REDUCE * sizeof(float);
-    cudaFuncSetAttribute(PythiaDecoderLayerKernel, cudaFuncAttributeMaxDynamicSharedMemorySize, max_shmem_size);
+    cudaFuncSetAttribute(Pythia6b9DecoderLayerKernel, cudaFuncAttributeMaxDynamicSharedMemorySize, max_shmem_size);
     
     auto options = torch::TensorOptions().dtype(torch::kFloat16).device(torch::kCUDA, 0);
     torch::Tensor o = torch::full({1, HIDDEN_DIM}, 0, options);
@@ -65,10 +64,6 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> pythia_decoder_layer_sm1
     half* mlp_intermediate_ptr = reinterpret_cast<half*>(mlp_intermediate.data_ptr<at::Half>());
     half* post_ln_buffer_ptr = reinterpret_cast<half*>(post_ln_buffer.data_ptr<at::Half>());
 
-    // SEQ_LEN is the current cache length (before appending new token)
-    // Kernel will read cache[0:SEQ_LEN] and write to cache[SEQ_LEN]
-    // SEQ_LEN is the current valid cache length (before appending new token)
-    // Kernel will read cache[0:SEQ_LEN] and write new KV to cache[SEQ_LEN]
     const uint32_t SEQ_LEN = static_cast<uint32_t>(current_seq_len);
     const uint32_t seq_len = SEQ_LEN;
     const uint32_t max_cache_size = static_cast<uint32_t>(k_cache.size(0));
@@ -80,13 +75,10 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> pythia_decoder_layer_sm1
     CUtensorMap tensor_map_weight_o{};
     
     // QKV weight tensor map
-    // weight_qkv shape: [7680, 2560] = [out_dim, in_dim]
-    // TMA sees it as: size[0]=in_dim (cols), size[1]=out_dim (rows)
-    // box_size: load TMA_LOAD_ONCE input dims, HEAD_DIM output dims per head's Q/K/V
     constexpr uint32_t rank = 2;
-    uint64_t size[rank] = {HIDDEN_DIM, 3 * HEAD_NUM * HEAD_DIM};  // {2560, 7680}
-    uint64_t stride[rank - 1] = {HIDDEN_DIM * sizeof(half)};      // bytes per row
-    uint32_t box_size[rank] = {TMA_LOAD_ONCE, HEAD_DIM};          // {64, 80}
+    uint64_t size[rank] = {HIDDEN_DIM, 3 * HEAD_NUM * HEAD_DIM};  // {4096, 12288}
+    uint64_t stride[rank - 1] = {HIDDEN_DIM * sizeof(half)};
+    uint32_t box_size[rank] = {TMA_LOAD_ONCE, HEAD_DIM};          // {64, 128}
     uint32_t elem_stride[rank] = {1, 1};
     
     CUresult res = cuTensorMapEncodeTiled(
@@ -104,7 +96,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> pythia_decoder_layer_sm1
         CUtensorMapFloatOOBfill::CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE
     );
 
-    // K cache tensor map - use SEQ_LEN so TMA auto-fills OOB positions with 0
+    // K cache tensor map
     uint64_t size_k_cache[rank] = {HIDDEN_DIM, SEQ_LEN};
     uint64_t stride_k_cache[rank - 1] = {HIDDEN_DIM * sizeof(half)};
     uint32_t box_size_k_cache[rank] = {HEAD_DIM, TMA_LOAD_ONCE / 2};
@@ -125,7 +117,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> pythia_decoder_layer_sm1
         CUtensorMapFloatOOBfill::CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE
     );
 
-    // V cache tensor map - use SEQ_LEN so TMA auto-fills OOB positions with 0
+    // V cache tensor map
     uint64_t size_v_cache[rank] = {HIDDEN_DIM, SEQ_LEN};
     uint64_t stride_v_cache[rank - 1] = {HIDDEN_DIM * sizeof(half)};
     uint32_t box_size_v_cache[rank] = {HEAD_DIM, TMA_LOAD_ONCE / 2};
@@ -147,9 +139,6 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> pythia_decoder_layer_sm1
     );
 
     // Output projection weight tensor map
-    // weight_o shape: [out_dim=hidden, in_dim=hidden]
-    // size: {in_dim, out_dim} for TMA
-    // box_size: {HEAD_DIM, TMA_LOAD_ONCE} - load HEAD_DIM input dims and TMA_LOAD_ONCE output dims
     uint64_t size_weight_o[rank] = {HIDDEN_DIM, HIDDEN_DIM};
     uint64_t stride_weight_o[rank - 1] = {HIDDEN_DIM * sizeof(half)};
     uint32_t box_size_weight_o[rank] = {HEAD_DIM, TMA_LOAD_ONCE};
@@ -171,13 +160,10 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> pythia_decoder_layer_sm1
     );
 
     // MLP up weight tensor map
-    // mlp_up_weight shape: [ffn_dim=10240, hidden_dim=2560]
-    // TMA: size = {in_dim=hidden, out_dim=ffn}, box = {TMA_LOAD_ONCE, HEAD_DIM}
-    // Each block loads HEAD_DIM (80) output dims (same pattern as QKV projection)
     CUtensorMap tensor_map_mlp_up{};
     uint64_t size_mlp_up[rank] = {HIDDEN_DIM, FFN_DIM};
     uint64_t stride_mlp_up[rank - 1] = {HIDDEN_DIM * sizeof(half)};
-    uint32_t box_size_mlp_up[rank] = {TMA_LOAD_ONCE, HEAD_DIM};  // Same as QKV
+    uint32_t box_size_mlp_up[rank] = {TMA_LOAD_ONCE, HEAD_DIM};
     uint32_t elem_stride_mlp_up[rank] = {1, 1};
     
     CUresult res_mlp_up = cuTensorMapEncodeTiled(
@@ -196,9 +182,6 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> pythia_decoder_layer_sm1
     );
 
     // MLP down weight tensor map
-    // mlp_down_weight shape: [hidden_dim=2560, ffn_dim=10240]
-    // TMA: size = {in_dim=ffn, out_dim=hidden}, box = {TMA_LOAD_ONCE, HEAD_DIM}
-    // Each cluster loads HEAD_DIM (80) output dims
     CUtensorMap tensor_map_mlp_down{};
     uint64_t size_mlp_down[rank] = {FFN_DIM, HIDDEN_DIM};
     uint64_t stride_mlp_down[rank - 1] = {FFN_DIM * sizeof(half)};
@@ -240,7 +223,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> pythia_decoder_layer_sm1
     };
     
     cudaLaunchCooperativeKernel(
-        (void*)PythiaDecoderLayerKernel,
+        (void*)Pythia6b9DecoderLayerKernel,
         grid, block,
         kernel_args,
         max_shmem_size
@@ -249,3 +232,6 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> pythia_decoder_layer_sm1
     cudaDeviceSynchronize();
     return std::make_tuple(o, k, v);
 }
+
+
+

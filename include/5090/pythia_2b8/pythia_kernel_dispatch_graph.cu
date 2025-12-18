@@ -74,7 +74,7 @@ static std::unordered_map<int64_t, PythiaGraphContext> g_contexts;
  * Create static context for CUDA Graph execution.
  * Call once per layer before graph capture.
  */
-void pythia_create_graph_context_sm120(
+void pythia_2b8_create_graph_context_sm120(
     int64_t context_id,
     torch::Tensor k_cache,
     torch::Tensor v_cache,
@@ -209,7 +209,7 @@ void pythia_create_graph_context_sm120(
  * Execute one decode step using pre-created context.
  * This function can be captured in a CUDA Graph.
  */
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> pythia_graph_decode_step_sm120(
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> pythia_2b8_graph_decode_step_sm120(
     int64_t context_id,
     torch::Tensor input,
     torch::Tensor layernorm_weight,
@@ -289,6 +289,6 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> pythia_graph_decode_step
 /**
  * Destroy context and free resources.
  */
-void pythia_destroy_graph_context_sm120(int64_t context_id) {
+void pythia_2b8_destroy_graph_context_sm120(int64_t context_id) {
     g_contexts.erase(context_id);
 }

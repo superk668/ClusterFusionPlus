@@ -22,8 +22,12 @@ if _arch == "sm120a":
         "include/5090/llama/llama_kernel_dispatch.cu",
         "include/5090/llama/llama_kernel_sglang_dispatch.cu",
         "include/5090/llama/llama_kernel_batch_sglang_dispatch.cu",
-        "include/5090/pythia/pythia_kernel_dispatch.cu",
-        "include/5090/pythia/pythia_kernel_dispatch_graph.cu",
+        # Pythia-2.8B
+        "include/5090/pythia_2b8/pythia_kernel_dispatch.cu",
+        "include/5090/pythia_2b8/pythia_kernel_dispatch_graph.cu",
+        # Pythia-6.9B
+        "include/5090/pythia_6b9/pythia_kernel_dispatch.cu",
+        "include/5090/pythia_6b9/pythia_kernel_dispatch_graph.cu",
     ]
     gencode = "-gencode=arch=compute_120a,code=sm_120a"
 elif _arch == "sm90a":
