@@ -480,6 +480,47 @@ def main():
     print("=" * 110)
     print(f"Graph vs Fused improvement: +{(avg_graph/avg_cf - 1)*100:.1f}%")
     print(f"Split vs Fused overhead:    {(avg_split/avg_cf - 1)*100:+.1f}%")
+    
+    # Hybrid estimation based on kernel split ratio
+    # From ablation: Attention+MLPUp ≈ 88% of fused kernel, MLPDown ≈ 12%
+    ATTN_RATIO = 0.88
+    MLP_RATIO = 0.12
+    
+    print("\n" + "=" * 110)
+    print("Estimated Hybrid Configurations (based on kernel time distribution)")
+    print("=" * 110)
+    print(f"Kernel time distribution: Attention+MLPUp={ATTN_RATIO*100:.0f}%, MLPDown={MLP_RATIO*100:.0f}%")
+    print()
+    print(f"{'Tokens':>8} | {'CUDA Attn+Up':>12} | {'CUDA MLPDown':>12} | {'CUDA Attn↑':>10} | {'CUDA MLP↑':>10}")
+    print(f"{'':>8} | {'+ PT Down':>12} | {'+ PT Attn':>12} | {'':>10} | {'':>10}")
+    print("-" * 70)
+    
+    for r in results:
+        # Hybrid 1: CUDA Attention+MLPUp + PyTorch MLPDown
+        # Time = CUDA(Attn+Up) + PyTorch(Down)
+        # Estimate: fused_time * ATTN_RATIO + hf_time * MLP_RATIO
+        cuda_attn_pt_mlp = r['cf_decode_s'] * ATTN_RATIO + r['hf_decode_s'] * MLP_RATIO
+        
+        # Hybrid 2: PyTorch Attention+MLPUp + CUDA MLPDown
+        # Time = PyTorch(Attn+Up) + CUDA(Down)
+        # Estimate: hf_time * ATTN_RATIO + fused_time * MLP_RATIO
+        pt_attn_cuda_mlp = r['hf_decode_s'] * ATTN_RATIO + r['cf_decode_s'] * MLP_RATIO
+        
+        speedup_cuda_attn = r['hf_decode_s'] / cuda_attn_pt_mlp
+        speedup_cuda_mlp = r['hf_decode_s'] / pt_attn_cuda_mlp
+        
+        print(f"{r['tokens']:>8} | {cuda_attn_pt_mlp:>10.3f}s  | {pt_attn_cuda_mlp:>10.3f}s  | "
+              f"{speedup_cuda_attn:>9.2f}x | {speedup_cuda_mlp:>9.2f}x")
+    
+    # Summary of hybrid speedups
+    print("-" * 70)
+    avg_cuda_attn = sum(r['hf_decode_s'] / (r['cf_decode_s'] * ATTN_RATIO + r['hf_decode_s'] * MLP_RATIO) 
+                        for r in results) / len(results)
+    avg_cuda_mlp = sum(r['hf_decode_s'] / (r['hf_decode_s'] * ATTN_RATIO + r['cf_decode_s'] * MLP_RATIO) 
+                       for r in results) / len(results)
+    print(f"\nAverage CUDA Attn+Up only: {avg_cuda_attn:.2f}x (主要加速来源)")
+    print(f"Average CUDA MLPDown only: {avg_cuda_mlp:.2f}x (收益有限)")
+    print(f"\n结论: Attention+MLPUp 贡献了 {(avg_cuda_attn-1)/(avg_cf-1)*100:.0f}% 的加速")
 
 
 if __name__ == "__main__":
