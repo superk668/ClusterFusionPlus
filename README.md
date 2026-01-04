@@ -240,16 +240,24 @@ Comparing different kernel configurations (Pythia-2.8B, decode-only timing):
 | Fused Kernel | Cooperative launch with grid.sync() | 1.15x | 1.24x |
 | **Graph Mode** | Pre-created TensorMaps, static buffers | **1.23x** | **1.33x** |
 
-### Hybrid Configuration Analysis
+### Hybrid Configuration Analysis (Actual Measurements)
 
-Based on kernel time distribution (Attention+MLPUp ≈ 88%, MLPDown ≈ 12%):
+Testing individual kernel contributions by running one part in CUDA and the other in PyTorch:
 
-| Configuration | Estimated Speedup | Contribution |
-|---------------|-------------------|--------------|
-| CUDA Attention+MLPUp + PyTorch MLPDown | 1.17x | 85% of total speedup |
-| PyTorch Attention + CUDA MLPDown | 1.02x | 15% of total speedup |
+| Configuration | Avg Speedup | Note |
+|---------------|-------------|------|
+| **CUDA Attn+MLPUp + PyTorch MLPDown** | **1.12x** | Main speedup source (77% contribution) |
+| PyTorch Attn+MLPUp + CUDA MLPDown | 0.56x | Slower due to PyTorch overhead |
 
-**Conclusion**: The majority of speedup comes from the attention path fusion. MLP-only acceleration provides minimal benefit.
+**Key Findings**:
+- The **Attention+MLPUp kernel** contributes **77%** of the total speedup
+- The **MLPDown kernel** alone provides **0%** benefit (negative due to overhead)
+- Running MLPDown in CUDA while Attention uses PyTorch is **slower** than pure PyTorch because:
+  1. PyTorch's attention implementation has significant overhead
+  2. Data transfer between PyTorch and CUDA kernel adds latency
+  3. MLPDown is only a small fraction (~12%) of the total compute
+
+**Conclusion**: For practical deployment, use the full fused kernel or Graph mode. Single-kernel optimization is not beneficial.
 
 ---
 
@@ -270,6 +278,18 @@ output, k_new, v_new = clusterfusion.pythia_2b8_decoder_layer(
 
 # Split kernel (two regular launches, no grid.sync needed)
 output, k_new, v_new = clusterfusion.pythia_2b8_decoder_layer_split(...)
+
+# Attention-only kernel (for hybrid configurations)
+attn_output, mlp_intermediate, k_new, v_new = clusterfusion.pythia_2b8_attention_only(
+    input, weight_qkv, bias_qkv, weight_o, bias_o,
+    k_cache, v_cache, ln_weight, ln_bias, cos, sin,
+    post_ln_weight, post_ln_bias, mlp_up_weight, mlp_up_bias,
+    current_seq_len
+)
+# Then complete with PyTorch: output = input + attn_output + F.linear(mlp_intermediate, mlp_down_weight, mlp_down_bias)
+
+# MLP-only kernel (for hybrid configurations)
+output = clusterfusion.pythia_2b8_mlp_only(input, attn_output, mlp_intermediate, mlp_down_weight, mlp_down_bias)
 
 # CUDA Graph optimized (pre-created TensorMaps)
 clusterfusion.pythia_2b8_create_graph_context(ctx_id, k_cache, v_cache, weight_qkv, weight_o, mlp_up_weight, mlp_down_weight, max_seq_len)

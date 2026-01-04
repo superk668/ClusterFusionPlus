@@ -393,6 +393,220 @@ def decode_hf(model, input_ids, num_new_tokens):
     return decode_time, generated_ids
 
 
+def decode_cuda_attn_pytorch_mlp(model, prompt, num_new_tokens, state):
+    """
+    Hybrid: CUDA Attention+MLPUp kernel + PyTorch MLP Down.
+    This measures the actual performance of using only the attention kernel.
+    """
+    import torch.nn.functional as F
+    device = next(model.parameters()).device
+    num_layers = len(model.gpt_neox.layers)
+    head_dim = 80
+    hidden_size = 2560
+    rotary_dim = 20
+
+    next_token = state["first_token"]
+    generated_ids = [next_token.item()]
+    prompt_length = state["prompt_length"]
+    all_weights = state["all_weights"]
+    kv_caches = [
+        (k.clone(), v.clone(), cur_len)
+        for (k, v, cur_len) in state["kv_caches"]
+    ]
+
+    max_position = prompt_length + num_new_tokens
+    all_cos, all_sin = precompute_rope_embeddings(max_position, rotary_dim, head_dim, device=device)
+
+    torch.cuda.synchronize()
+    start = time.time()
+    with torch.no_grad():
+        for step in range(num_new_tokens - 1):
+            current_position = prompt_length + step
+            hidden_states = model.gpt_neox.embed_in(next_token).half().squeeze(1)
+            cos = all_cos[current_position:current_position+1]
+            sin = all_sin[current_position:current_position+1]
+
+            for layer_idx in range(num_layers):
+                weights = all_weights[layer_idx]
+                k_cache_full, v_cache_full, current_len = kv_caches[layer_idx]
+                input_for_residual = hidden_states.clone()
+
+                # CUDA kernel: Attention + MLP Up
+                attn_output, mlp_intermediate, _, _ = clusterfusion.pythia_2b8_attention_only(
+                    hidden_states,
+                    weights["qkv_weight"],
+                    weights["qkv_bias"],
+                    weights["o_weight"],
+                    weights["o_bias"],
+                    k_cache_full,
+                    v_cache_full,
+                    weights["ln_weight"],
+                    weights["ln_bias"],
+                    cos,
+                    sin,
+                    weights["post_ln_weight"],
+                    weights["post_ln_bias"],
+                    weights["mlp_up_weight"],
+                    weights["mlp_up_bias"],
+                    current_len,
+                )
+                
+                # PyTorch: MLP Down + Residual
+                mlp_down = F.linear(mlp_intermediate, weights["mlp_down_weight"], weights["mlp_down_bias"])
+                hidden_states = input_for_residual + attn_output + mlp_down
+                
+                kv_caches[layer_idx] = (k_cache_full, v_cache_full, current_len + 1)
+
+            hidden_states = torch.nn.functional.layer_norm(
+                hidden_states,
+                (hidden_size,),
+                model.gpt_neox.final_layer_norm.weight.data,
+                model.gpt_neox.final_layer_norm.bias.data,
+                eps=1e-5,
+            )
+            logits = model.embed_out(hidden_states)
+            next_token = torch.argmax(logits, dim=-1, keepdim=True)
+            generated_ids.append(next_token.item())
+
+    torch.cuda.synchronize()
+    decode_time = time.time() - start
+    return decode_time, generated_ids
+
+
+def decode_pytorch_attn_cuda_mlp(model, prompt, num_new_tokens, state):
+    """
+    Hybrid: PyTorch Attention+MLPUp + CUDA MLP Down kernel.
+    This measures the actual performance of using only the MLP kernel.
+    """
+    import torch.nn.functional as F
+    device = next(model.parameters()).device
+    num_layers = len(model.gpt_neox.layers)
+    num_heads = 32
+    head_dim = 80
+    hidden_size = 2560
+    rotary_dim = 20
+
+    next_token = state["first_token"]
+    generated_ids = [next_token.item()]
+    prompt_length = state["prompt_length"]
+    all_weights = state["all_weights"]
+    kv_caches = [
+        (k.clone(), v.clone(), cur_len)
+        for (k, v, cur_len) in state["kv_caches"]
+    ]
+
+    max_position = prompt_length + num_new_tokens
+    all_cos, all_sin = precompute_rope_embeddings(max_position, rotary_dim, head_dim, device=device)
+
+    def apply_rotary_emb(x, cos, sin, rotary_dim):
+        """Apply rotary embeddings to first rotary_dim dimensions."""
+        x_rot = x[..., :rotary_dim]
+        x_pass = x[..., rotary_dim:]
+        cos_t = cos[:, :rotary_dim].unsqueeze(0).unsqueeze(0)  # [1, 1, 1, rotary_dim]
+        sin_t = sin[:, :rotary_dim].unsqueeze(0).unsqueeze(0)
+        x1 = x_rot[..., ::2]
+        x2 = x_rot[..., 1::2]
+        cos_t = cos_t[..., ::2]
+        sin_t = sin_t[..., ::2]
+        x_rot_out = torch.cat([
+            x1 * cos_t - x2 * sin_t,
+            x1 * sin_t + x2 * cos_t
+        ], dim=-1)
+        return torch.cat([x_rot_out, x_pass], dim=-1)
+
+    torch.cuda.synchronize()
+    start = time.time()
+    with torch.no_grad():
+        for step in range(num_new_tokens - 1):
+            current_position = prompt_length + step
+            hidden_states = model.gpt_neox.embed_in(next_token).half().squeeze(1)
+            cos = all_cos[current_position:current_position+1]
+            sin = all_sin[current_position:current_position+1]
+
+            for layer_idx in range(num_layers):
+                layer = model.gpt_neox.layers[layer_idx]
+                weights = all_weights[layer_idx]
+                k_cache_full, v_cache_full, current_len = kv_caches[layer_idx]
+                input_for_residual = hidden_states.clone()
+
+                # PyTorch: LayerNorm
+                ln_out = F.layer_norm(
+                    hidden_states.float(),
+                    (hidden_size,),
+                    weights["ln_weight"].squeeze(0).float(),
+                    weights["ln_bias"].squeeze(0).float(),
+                    eps=1e-5,
+                ).half()
+
+                # PyTorch: QKV projection
+                qkv = F.linear(ln_out, weights["qkv_weight"], weights["qkv_bias"])
+                qkv = qkv.view(1, 1, num_heads, 3, head_dim)
+                q = qkv[:, :, :, 0, :]
+                k = qkv[:, :, :, 1, :]
+                v = qkv[:, :, :, 2, :]
+
+                # PyTorch: RoPE
+                q = apply_rotary_emb(q, cos, sin, rotary_dim)
+                k = apply_rotary_emb(k, cos, sin, rotary_dim)
+
+                # Update KV cache
+                k_flat = k.reshape(1, -1)
+                v_flat = v.reshape(1, -1)
+                k_cache_full[current_len] = k_flat
+                v_cache_full[current_len] = v_flat
+
+                # PyTorch: Attention
+                k_cache = k_cache_full[:current_len+1].view(current_len+1, num_heads, head_dim)
+                v_cache = v_cache_full[:current_len+1].view(current_len+1, num_heads, head_dim)
+                q = q.squeeze(1)  # [1, num_heads, head_dim]
+                scores = torch.einsum('bhd,shd->bhs', q.float(), k_cache.float()) / (head_dim ** 0.5)
+                attn_weights = F.softmax(scores, dim=-1)
+                attn_out = torch.einsum('bhs,shd->bhd', attn_weights, v_cache.float()).half()
+
+                # PyTorch: Output projection
+                attn_out_flat = attn_out.view(1, -1)
+                attn_output = F.linear(attn_out_flat, weights["o_weight"], weights["o_bias"])
+
+                # PyTorch: Post-LayerNorm
+                post_ln = F.layer_norm(
+                    ln_out.float(),  # Pythia uses parallel residual, so post_ln input is ln_out
+                    (hidden_size,),
+                    weights["post_ln_weight"].squeeze(0).float(),
+                    weights["post_ln_bias"].squeeze(0).float(),
+                    eps=1e-5,
+                ).half()
+
+                # PyTorch: MLP Up + GELU
+                mlp_up = F.linear(post_ln, weights["mlp_up_weight"], weights["mlp_up_bias"])
+                mlp_intermediate = F.gelu(mlp_up, approximate='tanh')
+
+                # CUDA kernel: MLP Down + Residual
+                hidden_states = clusterfusion.pythia_2b8_mlp_only(
+                    input_for_residual,
+                    attn_output,
+                    mlp_intermediate.squeeze(0),  # [FFN_DIM]
+                    weights["mlp_down_weight"],
+                    weights["mlp_down_bias"],
+                )
+
+                kv_caches[layer_idx] = (k_cache_full, v_cache_full, current_len + 1)
+
+            hidden_states = torch.nn.functional.layer_norm(
+                hidden_states,
+                (hidden_size,),
+                model.gpt_neox.final_layer_norm.weight.data,
+                model.gpt_neox.final_layer_norm.bias.data,
+                eps=1e-5,
+            )
+            logits = model.embed_out(hidden_states)
+            next_token = torch.argmax(logits, dim=-1, keepdim=True)
+            generated_ids.append(next_token.item())
+
+    torch.cuda.synchronize()
+    decode_time = time.time() - start
+    return decode_time, generated_ids
+
+
 def main():
     print("=" * 80)
     print("Pythia-2.8B Benchmark: ClusterFusion vs HuggingFace")
@@ -415,6 +629,10 @@ def main():
     decode_clusterfusion_graph_context(model, PROMPT, 8, warmup_state)
     warmup_state = prepare_setup(model, tokenizer, PROMPT, 8)
     decode_clusterfusion_split(model, PROMPT, 8, warmup_state)
+    warmup_state = prepare_setup(model, tokenizer, PROMPT, 8)
+    decode_cuda_attn_pytorch_mlp(model, PROMPT, 8, warmup_state)
+    warmup_state = prepare_setup(model, tokenizer, PROMPT, 8)
+    decode_pytorch_attn_cuda_mlp(model, PROMPT, 8, warmup_state)
     decode_hf(model, warmup_state["input_ids"], 8)
     torch.cuda.synchronize()
 
@@ -431,6 +649,14 @@ def main():
         state3 = prepare_setup(model, tokenizer, PROMPT, num_tokens)
         cf_split_time, ids_split = decode_clusterfusion_split(model, PROMPT, num_tokens, state3)
         
+        # Hybrid test: CUDA Attention + PyTorch MLP
+        state4 = prepare_setup(model, tokenizer, PROMPT, num_tokens)
+        cuda_attn_time, ids_cuda_attn = decode_cuda_attn_pytorch_mlp(model, PROMPT, num_tokens, state4)
+        
+        # Hybrid test: PyTorch Attention + CUDA MLP
+        state5 = prepare_setup(model, tokenizer, PROMPT, num_tokens)
+        cuda_mlp_time, ids_cuda_mlp = decode_pytorch_attn_cuda_mlp(model, PROMPT, num_tokens, state5)
+        
         hf_time, ids_hf = decode_hf(model, state["input_ids"], num_tokens)
 
         results.append(
@@ -439,10 +665,14 @@ def main():
                 "cf_decode_s": cf_time,
                 "cf_graph_s": cf_graph_time,
                 "cf_split_s": cf_split_time,
+                "cuda_attn_s": cuda_attn_time,
+                "cuda_mlp_s": cuda_mlp_time,
                 "hf_decode_s": hf_time,
                 "speedup_cf": hf_time / cf_time if cf_time > 0 else float("inf"),
                 "speedup_graph": hf_time / cf_graph_time if cf_graph_time > 0 else float("inf"),
                 "speedup_split": hf_time / cf_split_time if cf_split_time > 0 else float("inf"),
+                "speedup_cuda_attn": hf_time / cuda_attn_time if cuda_attn_time > 0 else float("inf"),
+                "speedup_cuda_mlp": hf_time / cuda_mlp_time if cuda_mlp_time > 0 else float("inf"),
                 "match": ids_hf == (state["input_ids"][0].tolist() + ids_kernel),
                 "match_graph": ids_hf == (state["input_ids"][0].tolist() + ids_graph),
                 "match_split": ids_hf == (state["input_ids"][0].tolist() + ids_split),
@@ -481,46 +711,33 @@ def main():
     print(f"Graph vs Fused improvement: +{(avg_graph/avg_cf - 1)*100:.1f}%")
     print(f"Split vs Fused overhead:    {(avg_split/avg_cf - 1)*100:+.1f}%")
     
-    # Hybrid estimation based on kernel split ratio
-    # From ablation: Attention+MLPUp ≈ 88% of fused kernel, MLPDown ≈ 12%
-    ATTN_RATIO = 0.88
-    MLP_RATIO = 0.12
-    
+    # Actual Hybrid Measurements
     print("\n" + "=" * 110)
-    print("Estimated Hybrid Configurations (based on kernel time distribution)")
+    print("Hybrid Configuration Results (Actual Measurements)")
     print("=" * 110)
-    print(f"Kernel time distribution: Attention+MLPUp={ATTN_RATIO*100:.0f}%, MLPDown={MLP_RATIO*100:.0f}%")
+    print("CUDA Attn+Up + PT Down: Uses CUDA kernel for Attention+MLPUp, PyTorch for MLPDown+Residual")
+    print("PT Attn+Up + CUDA Down: Uses PyTorch for Attention+MLPUp, CUDA kernel for MLPDown+Residual")
     print()
-    print(f"{'Tokens':>8} | {'CUDA Attn+Up':>12} | {'CUDA MLPDown':>12} | {'CUDA Attn↑':>10} | {'CUDA MLP↑':>10}")
-    print(f"{'':>8} | {'+ PT Down':>12} | {'+ PT Attn':>12} | {'':>10} | {'':>10}")
+    print(f"{'Tokens':>8} | {'CUDA Attn':>12} | {'CUDA MLP':>12} | {'Attn↑':>8} | {'MLP↑':>8}")
+    print(f"{'':>8} | {'+PT Down(s)':>12} | {'+PT Attn(s)':>12} | {'':>8} | {'':>8}")
     print("-" * 70)
     
     for r in results:
-        # Hybrid 1: CUDA Attention+MLPUp + PyTorch MLPDown
-        # Time = CUDA(Attn+Up) + PyTorch(Down)
-        # Estimate: fused_time * ATTN_RATIO + hf_time * MLP_RATIO
-        cuda_attn_pt_mlp = r['cf_decode_s'] * ATTN_RATIO + r['hf_decode_s'] * MLP_RATIO
-        
-        # Hybrid 2: PyTorch Attention+MLPUp + CUDA MLPDown
-        # Time = PyTorch(Attn+Up) + CUDA(Down)
-        # Estimate: hf_time * ATTN_RATIO + fused_time * MLP_RATIO
-        pt_attn_cuda_mlp = r['hf_decode_s'] * ATTN_RATIO + r['cf_decode_s'] * MLP_RATIO
-        
-        speedup_cuda_attn = r['hf_decode_s'] / cuda_attn_pt_mlp
-        speedup_cuda_mlp = r['hf_decode_s'] / pt_attn_cuda_mlp
-        
-        print(f"{r['tokens']:>8} | {cuda_attn_pt_mlp:>10.3f}s  | {pt_attn_cuda_mlp:>10.3f}s  | "
-              f"{speedup_cuda_attn:>9.2f}x | {speedup_cuda_mlp:>9.2f}x")
+        print(f"{r['tokens']:>8} | {r['cuda_attn_s']:>12.3f} | {r['cuda_mlp_s']:>12.3f} | "
+              f"{r['speedup_cuda_attn']:>7.2f}x | {r['speedup_cuda_mlp']:>7.2f}x")
     
     # Summary of hybrid speedups
     print("-" * 70)
-    avg_cuda_attn = sum(r['hf_decode_s'] / (r['cf_decode_s'] * ATTN_RATIO + r['hf_decode_s'] * MLP_RATIO) 
-                        for r in results) / len(results)
-    avg_cuda_mlp = sum(r['hf_decode_s'] / (r['hf_decode_s'] * ATTN_RATIO + r['cf_decode_s'] * MLP_RATIO) 
-                       for r in results) / len(results)
+    avg_cuda_attn = sum(r['speedup_cuda_attn'] for r in results) / len(results)
+    avg_cuda_mlp = sum(r['speedup_cuda_mlp'] for r in results) / len(results)
     print(f"\nAverage CUDA Attn+Up only: {avg_cuda_attn:.2f}x (主要加速来源)")
-    print(f"Average CUDA MLPDown only: {avg_cuda_mlp:.2f}x (收益有限)")
-    print(f"\n结论: Attention+MLPUp 贡献了 {(avg_cuda_attn-1)/(avg_cf-1)*100:.0f}% 的加速")
+    print(f"Average CUDA MLPDown only: {avg_cuda_mlp:.2f}x")
+    
+    if avg_cf > 1:
+        attn_contribution = (avg_cuda_attn - 1) / (avg_cf - 1) * 100
+        mlp_contribution = (avg_cuda_mlp - 1) / (avg_cf - 1) * 100 if avg_cuda_mlp > 1 else 0
+        print(f"\n结论: Attention+MLPUp 贡献了 {attn_contribution:.0f}% 的加速")
+        print(f"      MLPDown 贡献了 {mlp_contribution:.0f}% 的加速")
 
 
 if __name__ == "__main__":
