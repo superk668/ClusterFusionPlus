@@ -131,9 +131,16 @@ def prepare_state(prompt, num_new_tokens):
 # Decode: HuggingFace (realistic baseline)
 # =============================================================================
 def decode_hf(state, num_tokens):
-    next_token = state['next_token'].clone()
-    past_key_values = state['past_key_values']
+    """Match original benchmark: run prefill ourselves outside timing"""
+    input_ids = state['input_ids']
     
+    # Prefill outside timing (matches original benchmark)
+    with torch.no_grad():
+        outputs = model(input_ids, use_cache=True)
+        past_key_values = outputs.past_key_values
+        next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
+    
+    # Decode-only timing
     torch.cuda.synchronize()
     start = time.perf_counter()
     
@@ -300,6 +307,18 @@ print("\n" + "=" * 90)
 print("Benchmark: Decode Time Only (excluding prefill)")
 print("=" * 90)
 
+# Global warmup (matching original benchmark)
+print("\nWarming up...")
+warmup_state = prepare_state(PROMPT, 8)
+_ = decode_fused(warmup_state, 8)
+warmup_state = prepare_state(PROMPT, 8)
+_ = decode_graph(warmup_state, 8)
+warmup_state = prepare_state(PROMPT, 8)
+_ = decode_split(warmup_state, 8)
+warmup_state = prepare_state(PROMPT, 8)
+_ = decode_hf(warmup_state, 8)
+torch.cuda.synchronize()
+
 print("\n" + "-" * 110)
 print(f"{'Tokens':<8} | {'HF(s)':<10} | {'Fused(s)':<10} | {'Graph(s)':<10} | {'Split(s)':<10} | "
       f"{'Fused↑':<8} | {'Graph↑':<8} | {'Split↑':<8}")
@@ -307,22 +326,7 @@ print("-" * 110)
 
 results = []
 for num_tokens in TOKEN_COUNTS:
-    # Prepare state
-    state = prepare_state(PROMPT, num_tokens)
-    
-    # Warmup
-    _ = decode_hf(state, min(8, num_tokens))
-    state = prepare_state(PROMPT, num_tokens)
-    _ = decode_fused(state, min(8, num_tokens))
-    state = prepare_state(PROMPT, num_tokens)
-    _ = decode_graph(state, min(8, num_tokens))
-    state = prepare_state(PROMPT, num_tokens)
-    _ = decode_split(state, min(8, num_tokens))
-    
-    # Actual benchmark
-    state = prepare_state(PROMPT, num_tokens)
-    hf_time = decode_hf(state, num_tokens)
-    
+    # Order matches original: CF -> Graph -> HF
     state = prepare_state(PROMPT, num_tokens)
     fused_time = decode_fused(state, num_tokens)
     
@@ -331,6 +335,9 @@ for num_tokens in TOKEN_COUNTS:
     
     state = prepare_state(PROMPT, num_tokens)
     split_time = decode_split(state, num_tokens)
+    
+    # HF uses state's input_ids but runs its own prefill
+    hf_time = decode_hf(state, num_tokens)
     
     fused_speedup = hf_time / fused_time
     graph_speedup = hf_time / graph_time
