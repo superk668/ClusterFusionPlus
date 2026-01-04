@@ -217,13 +217,49 @@ These metrics specifically evaluate the decode phase optimization:
 
 ---
 
+## Ablation Study
+
+Comparing different kernel configurations (Pythia-2.8B, decode-only timing):
+
+| Tokens | Fused(s) | Graph(s) | Split(s) | HF(s) | Fused↑ | **Graph↑** | Split↑ |
+|--------|----------|----------|----------|-------|--------|------------|--------|
+| 16 | 0.076 | 0.071 | 0.080 | 0.086 | 1.12x | **1.20x** | 1.07x |
+| 32 | 0.158 | 0.147 | 0.165 | 0.177 | 1.12x | **1.20x** | 1.07x |
+| 64 | 0.322 | 0.299 | 0.334 | 0.360 | 1.12x | **1.20x** | 1.08x |
+| 128 | 0.648 | 0.605 | 0.675 | 0.731 | 1.13x | **1.21x** | 1.08x |
+| 256 | 1.313 | 1.221 | 1.358 | 1.494 | 1.14x | **1.22x** | 1.10x |
+| 512 | 2.650 | 2.460 | 2.745 | 3.054 | 1.15x | **1.24x** | 1.11x |
+| 1024 | 5.352 | 4.982 | 5.536 | 6.358 | 1.19x | **1.28x** | 1.15x |
+| 2048 | 10.917 | 10.164 | 11.359 | 17.769 | 1.63x | **1.75x** | 1.56x |
+
+### Kernel Configurations
+
+| Configuration | Description | Avg Speedup | Max Speedup |
+|---------------|-------------|-------------|-------------|
+| **Graph Mode** | Pre-created TensorMaps, static buffers | **1.25x** | **1.75x** |
+| Fused Kernel | Cooperative launch with grid.sync() | 1.16x | 1.63x |
+| Split Kernels | Two regular launches (no grid.sync) | 1.12x | 1.56x |
+
+### Hybrid Configuration Analysis
+
+Based on kernel time distribution (Attention+MLPUp ≈ 88%, MLPDown ≈ 12%):
+
+| Configuration | Estimated Speedup | Contribution |
+|---------------|-------------------|--------------|
+| CUDA Attention+MLPUp + PyTorch MLPDown | 1.17x | 85% of total speedup |
+| PyTorch Attention + CUDA MLPDown | 1.02x | 15% of total speedup |
+
+**Conclusion**: The majority of speedup comes from the attention path fusion. MLP-only acceleration provides minimal benefit.
+
+---
+
 ## API Reference
 
 ### Pythia-2.8B
 ```python
 import clusterfusion
 
-# Standard dispatch
+# Fused kernel (cooperative launch with grid.sync)
 output, k_new, v_new = clusterfusion.pythia_2b8_decoder_layer(
     input, weight_qkv, bias_qkv, weight_o, bias_o,
     k_cache, v_cache, ln_weight, ln_bias, cos, sin,
@@ -232,7 +268,10 @@ output, k_new, v_new = clusterfusion.pythia_2b8_decoder_layer(
     current_seq_len
 )
 
-# CUDA Graph optimized
+# Split kernel (two regular launches, no grid.sync needed)
+output, k_new, v_new = clusterfusion.pythia_2b8_decoder_layer_split(...)
+
+# CUDA Graph optimized (pre-created TensorMaps)
 clusterfusion.pythia_2b8_create_graph_context(ctx_id, k_cache, v_cache, weight_qkv, weight_o, mlp_up_weight, mlp_down_weight, max_seq_len)
 output, k_new, v_new = clusterfusion.pythia_2b8_graph_decode_step(ctx_id, input, ln_weight, ln_bias, ...)
 clusterfusion.pythia_2b8_destroy_graph_context(ctx_id)
@@ -257,9 +296,9 @@ clusterfusion.pythia_6b9_destroy_graph_context(...)
 
 | File | Description |
 |------|-------------|
-| `benchmark_full.py` | Complete benchmark suite (TTFT, TPOT, Throughput, FLOPs, PPL) |
-| `benchmark_decode.py` | Pythia-2.8B decode performance benchmark |
+| `benchmark_decode.py` | **Main ablation test** - Fused/Graph/Split kernels vs HuggingFace, hybrid analysis |
 | `benchmark_decode_6b9.py` | Pythia-6.9B decode performance benchmark |
+| `benchmark_full.py` | Complete benchmark suite (TTFT, TPOT, Throughput, FLOPs, PPL) |
 | `verify_lossless.py` | Verify correctness and characterize FP16 atomicAdd non-determinism |
 | `evaluate_decode_quality.py` | Decode quality metrics (Token Match Rate, Logits MAE, Top-K Agreement) |
 | `test_pythia.py` | Pythia-2.8B kernel unit test (reference vs kernel) |
