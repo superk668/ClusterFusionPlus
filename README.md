@@ -223,41 +223,22 @@ Comparing different kernel configurations (Pythia-2.8B, decode-only timing):
 
 | Tokens | Split(s) | Fused(s) | Graph(s) | HF(s) | Split↑ | Fused↑ | **Graph↑** |
 |--------|----------|----------|----------|-------|--------|--------|------------|
-| 16 | 0.080 | 0.077 | 0.071 | 0.086 | 1.07x | 1.12x | **1.20x** |
+| 16 | 0.080 | 0.076 | 0.071 | 0.086 | 1.08x | 1.12x | **1.21x** |
 | 32 | 0.165 | 0.158 | 0.147 | 0.177 | 1.07x | 1.12x | **1.20x** |
-| 64 | 0.334 | 0.322 | 0.299 | 0.360 | 1.08x | 1.12x | **1.20x** |
-| 128 | 0.675 | 0.648 | 0.605 | 0.731 | 1.08x | 1.13x | **1.21x** |
-| 256 | 1.358 | 1.313 | 1.221 | 1.494 | 1.10x | 1.14x | **1.22x** |
-| 512 | 2.742 | 2.651 | 2.459 | 3.050 | 1.11x | 1.15x | **1.24x** |
-| 1024 | 5.537 | 5.346 | 4.982 | 6.362 | 1.15x | 1.19x | **1.28x** |
-| 2048 | 11.243 | 10.909 | 10.165 | 13.546 | 1.20x | 1.24x | **1.33x** |
+| 64 | 0.334 | 0.322 | 0.299 | 0.360 | 1.08x | 1.12x | **1.21x** |
+| 128 | 0.675 | 0.649 | 0.604 | 0.732 | 1.08x | 1.13x | **1.21x** |
+| 256 | 1.360 | 1.316 | 1.221 | 1.484 | 1.09x | 1.13x | **1.22x** |
+| 512 | 2.745 | 2.648 | 2.459 | 3.047 | 1.11x | 1.15x | **1.24x** |
+| 1024 | 5.543 | 5.348 | 4.983 | 6.378 | 1.15x | 1.19x | **1.28x** |
+| 2048 | 11.454 | 10.913 | 10.167 | 13.814 | 1.21x | 1.27x | **1.36x** |
 
 ### Kernel Configurations
 
 | Configuration | Description | Avg Speedup | Max Speedup |
 |---------------|-------------|-------------|-------------|
-| Split Kernels | Two regular launches (no grid.sync) | 1.11x | 1.20x |
-| Fused Kernel | Cooperative launch with grid.sync() | 1.15x | 1.24x |
-| **Graph Mode** | Pre-created TensorMaps, static buffers | **1.23x** | **1.33x** |
-
-### Hybrid Configuration Analysis (Actual Measurements)
-
-Testing individual kernel contributions by running one part in CUDA and the other in PyTorch:
-
-| Configuration | Avg Speedup | Note |
-|---------------|-------------|------|
-| **CUDA Attn+MLPUp + PyTorch MLPDown** | **1.12x** | Main speedup source (77% contribution) |
-| PyTorch Attn+MLPUp + CUDA MLPDown | 0.56x | Slower due to PyTorch overhead |
-
-**Key Findings**:
-- The **Attention+MLPUp kernel** contributes **77%** of the total speedup
-- The **MLPDown kernel** alone provides **0%** benefit (negative due to overhead)
-- Running MLPDown in CUDA while Attention uses PyTorch is **slower** than pure PyTorch because:
-  1. PyTorch's attention implementation has significant overhead
-  2. Data transfer between PyTorch and CUDA kernel adds latency
-  3. MLPDown is only a small fraction (~12%) of the total compute
-
-**Conclusion**: For practical deployment, use the full fused kernel or Graph mode. Single-kernel optimization is not beneficial.
+| Split Kernels | Two regular launches (no grid.sync) | 1.11x | 1.21x |
+| Fused Kernel | Cooperative launch with grid.sync() | 1.15x | 1.27x |
+| **Graph Mode** | Pre-created TensorMaps, static buffers | **1.24x** | **1.36x** |
 
 ---
 
@@ -278,18 +259,6 @@ output, k_new, v_new = clusterfusion.pythia_2b8_decoder_layer(
 
 # Split kernel (two regular launches, no grid.sync needed)
 output, k_new, v_new = clusterfusion.pythia_2b8_decoder_layer_split(...)
-
-# Attention-only kernel (for hybrid configurations)
-attn_output, mlp_intermediate, k_new, v_new = clusterfusion.pythia_2b8_attention_only(
-    input, weight_qkv, bias_qkv, weight_o, bias_o,
-    k_cache, v_cache, ln_weight, ln_bias, cos, sin,
-    post_ln_weight, post_ln_bias, mlp_up_weight, mlp_up_bias,
-    current_seq_len
-)
-# Then complete with PyTorch: output = input + attn_output + F.linear(mlp_intermediate, mlp_down_weight, mlp_down_bias)
-
-# MLP-only kernel (for hybrid configurations)
-output = clusterfusion.pythia_2b8_mlp_only(input, attn_output, mlp_intermediate, mlp_down_weight, mlp_down_bias)
 
 # CUDA Graph optimized (pre-created TensorMaps)
 clusterfusion.pythia_2b8_create_graph_context(ctx_id, k_cache, v_cache, weight_qkv, weight_o, mlp_up_weight, mlp_down_weight, max_seq_len)
