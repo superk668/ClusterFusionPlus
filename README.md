@@ -1,4 +1,4 @@
-# ClusterFusion++：Expanding Cluster-Level Fusion to Full Transformer-Block Decoding
+# ClusterFusion++: Expanding Cluster-Level Fusion to Full Transformer-Block Decoding
 
 Prior work expands fusion scope by leveraging thread-block clusters and on-chip inter-block collectives to fuse attention-side operators (QKV projection, attention, and output projection). In this project, we develop **ClusterFusion++**, a **CUDA-level** extension that expands fusion further to the **full Transformer decoder block** for GPT-NeoX/Pythia models: LayerNorm $\rightarrow$ QKV $\rightarrow$ RoPE $\rightarrow$ decode attention $\rightarrow$ output projection $\rightarrow$ Post-LN $\rightarrow$ MLP $\rightarrow$ residual. We additionally engineer a CUDA-Graph-compatible execution mode with persistent Tensor Memory Accelerator (TMA) descriptors to reduce per-step overhead. 
 
